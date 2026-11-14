@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Frame display</title>
+<style>
+:root {
+  --bg: #f6f6f4;
+  --fg: #1c1c1c;
+  --muted: #666;
+  --line: #d4d4d0;
+  --field: #fff;
+  --accent: #1f4fd8;
+  --accent-fg: #fff;
+  --bad: #b3261e;
+  box-sizing: border-box;
+  padding-top: env(safe-area-inset-top, 0px);
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #151515; --fg: #ececec; --muted: #9a9a9a; --line: #333;
+    --field: #1e1e1e; --accent: #7aa2ff; --accent-fg: #0b1220; --bad: #ff8a80;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #151515; --fg: #ececec; --muted: #9a9a9a; --line: #333;
+  --field: #1e1e1e; --accent: #7aa2ff; --accent-fg: #0b1220; --bad: #ff8a80;
+  color-scheme: dark;
+}
+html { scroll-padding-top: env(safe-area-inset-top, 0px); }
+body {
+  margin: 0; background: var(--bg); color: var(--fg);
+  font: 17px/1.45 -apple-system, "Helvetica Neue", Arial, sans-serif;
+}
+main { max-width: 34rem; margin: 0 auto; padding: 1.25rem 1rem 2rem; }
+h1 { font-size: 1.35rem; margin: 0 0 .25rem; }
+p.status { margin: 0 0 1.25rem; color: var(--muted); min-height: 1.4em; }
+p.status.bad { color: var(--bad); }
+label { display: block; margin: 1.25rem 0 .4rem; font-weight: 600; }
+textarea, input[type="text"] {
+  width: 100%; box-sizing: border-box; padding: .7rem;
+  font: inherit; color: var(--fg); background: var(--field);
+  border: 1px solid var(--line); border-radius: 6px;
+}
+textarea { min-height: 6rem; resize: vertical; }
+.row { display: flex; gap: .6rem; margin-top: .6rem; flex-wrap: wrap; }
+button {
+  font: inherit; padding: .7rem 1.1rem; border-radius: 6px; cursor: pointer;
+  border: 1px solid var(--line); background: var(--field); color: var(--fg);
+}
+button.primary { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); font-weight: 600; }
+button:disabled { opacity: .45; cursor: default; }
+button:focus-visible, textarea:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+pre {
+  margin: 1.25rem 0 0; padding: .7rem; min-height: 5rem; max-height: 12rem; overflow: auto;
+  background: var(--field); border: 1px solid var(--line); border-radius: 6px;
+  font: 13px/1.4 ui-monospace, Menlo, monospace; white-space: pre-wrap; word-break: break-word;
+}
+</style>
+</head>
+<body>
+<main>
+  <h1>Frame display</h1>
+  <p class="status" id="status">Not connected</p>
+
+  <div class="row" style="margin-top:0">
+    <button class="primary" id="connect">Connect to Frame</button>
+    <button id="connectall">Try all devices</button>
+    <button id="disconnect" disabled>Disconnect</button>
+  </div>
+
+  <label for="msg">Text for the display</label>
+  <textarea id="msg" placeholder="Type something short"></textarea>
+  <div class="row">
+    <button class="primary" id="send" disabled>Show on glasses</button>
+    <button id="clear" disabled>Clear display</button>
+  </div>
+
+  <label for="lua">Lua command</label>
+  <input type="text" id="lua" value="print(frame.battery_level())" autocapitalize="off" autocorrect="off" spellcheck="false">
+  <div class="row">
+    <button id="runlua" disabled>Run</button>
+    <button id="stop" disabled>Stop running app</button>
+  </div>
+
+  <pre id="log" aria-live="polite"></pre>
+</main>
+
+<script>
+(function () {
+  var SVC = "7a230001-5475-a6a4-654c-8431f6ad49c4";
+  var RX  = "7a230002-5475-a6a4-654c-8431f6ad49c4"; // host writes here
+  var TX  = "7a230003-5475-a6a4-654c-8431f6ad49c4"; // Frame notifies here
+  var LINE_CHARS = 20, LINE_HEIGHT = 60, MAX_LINES = 6, MAX_CMD_BYTES = 100;
+
+  var dev = null, rx = null, tx = null;
+  var $ = function (id) { return document.getElementById(id); };
+  var enc = new TextEncoder(), dec = new TextDecoder();
+
+  function log(s) { var l = $("log"); l.textContent += s + "\n"; l.scrollTop = l.scrollHeight; }
+  function status(s, bad) { var e = $("status"); e.textContent = s; e.className = "status" + (bad ? " bad" : ""); }
+  function setConnected(on) {
+    ["disconnect", "send", "clear", "runlua", "stop"].forEach(function (id) { $(id).disabled = !on; });
+    $("connect").disabled = on;
+    $("connectall").disabled = on;
+  }
+
+  function write(bytes) {
+    return rx.writeValueWithResponse ? rx.writeValueWithResponse(bytes) : rx.writeValue(bytes);
+  }
+  function sendLua(code) {
+    var b = enc.encode(code);
+    if (b.length > MAX_CMD_BYTES) { throw new Error("Command too long (" + b.length + " bytes, max " + MAX_CMD_BYTES + ")"); }
+    return write(b);
+  }
+  function luaStr(s) { return '"' + s.replace(/\\/g, "\\\\").replace(/"/g, '\\"') + '"'; }
+
+  function wrap(text) {
+    var clean = text.normalize("NFKD").replace(/[^\x20-\x7e\n]/g, "");
+    var out = [];
+    clean.split("\n").forEach(function (para) {
+      var line = "";
+      para.split(/\s+/).filter(Boolean).forEach(function (w) {
+        while (w.length > LINE_CHARS) {
+          if (line) { out.push(line); line = ""; }
+          out.push(w.slice(0, LINE_CHARS)); w = w.slice(LINE_CHARS);
+        }
+        if (!line) { line = w; }
+        else if ((line + " " + w).length <= LINE_CHARS) { line += " " + w; }
+        else { out.push(line); line = w; }
+      });
+      if (line) { out.push(line); }
+    });
+    return out;
+  }
+
+  async function connect(all) {
+    if (!navigator.bluetooth) { status("This browser has no Web Bluetooth. Open this page in Bluefy.", true); return; }
+    try {
+      status("Choose your Frame in the list…");
+      log("1. Opening device picker");
+      dev = await navigator.bluetooth.requestDevice(all ? { acceptAllDevices: true, optionalServices: [SVC] } : { filters: [{ namePrefix: "Frame" }], optionalServices: [SVC] });
+      log("2. Picked: " + (dev.name || "unnamed"));
+      dev.addEventListener("gattserverdisconnected", function () { setConnected(false); status("Disconnected"); });
+      status("Connecting…");
+      log("3. Connecting (15 s limit)");
+      var server = null;
+      for (var attempt = 1; attempt <= 3 && !server; attempt++) {
+        try {
+          server = await Promise.race([
+            dev.gatt.connect(),
+            new Promise(function (_, rej) { setTimeout(function () { rej(new Error("Connection timed out after 15 s")); }, 15000); })
+          ]);
+        } catch (err) {
+          log("Attempt " + attempt + " failed: " + err);
+          if (attempt === 3) { throw err; }
+          await new Promise(function (r) { setTimeout(r, 2000); });
+          log("Retrying…");
+        }
+      }
+      log("4. Connected, finding service");
+      var svc = await server.getPrimaryService(SVC);
+      log("5. Service found, getting characteristics");
+      rx = await svc.getCharacteristic(RX);
+      tx = await svc.getCharacteristic(TX);
+      log("6. Starting notifications");
+      await tx.startNotifications();
+      tx.addEventListener("characteristicvaluechanged", function (ev) {
+        var v = new Uint8Array(ev.target.value.buffer);
+        if (v.length && v[0] === 1) { log("data: " + Array.from(v.slice(1)).join(",")); }
+        else { log("Frame: " + dec.decode(v)); }
+      });
+      setConnected(true);
+      status("Connected to " + (dev.name || "Frame"));
+      log("Connected.");
+    } catch (e) {
+      var detail = (e && e.name ? e.name + " / " : "") + (e && e.code !== undefined ? "code " + e.code + " / " : "") + (e && e.message ? e.message : e);
+      status("Could not connect: " + detail, true);
+      log("Error: " + detail);
+    }
+  }
+
+  async function showText() {
+    try {
+      var lines = wrap($("msg").value).slice(0, MAX_LINES);
+      if (!lines.length) { return; }
+      for (var i = 0; i < lines.length; i++) {
+        await sendLua("frame.display.text(" + luaStr(lines[i]) + ",1," + (i * LINE_HEIGHT + 1) + ")");
+      }
+      await sendLua("frame.display.show()");
+      log("Sent " + lines.length + " line(s).");
+    } catch (e) { log("Error: " + e.message); }
+  }
+
+  async function clearDisplay() {
+    try { await sendLua('frame.display.text(" ",1,1);frame.display.show()'); log("Cleared."); }
+    catch (e) { log("Error: " + e.message); }
+  }
+
+  async function runLua() {
+    try { await sendLua($("lua").value); log("> " + $("lua").value); }
+    catch (e) { log("Error: " + e.message); }
+  }
+
+  async function stopApp() {
+    try { await write(new Uint8Array([3])); log("Sent break signal."); }
+    catch (e) { log("Error: " + e.message); }
+  }
+
+  window.addEventListener("error", function (e) { log("Page error: " + e.message); });
+  window.addEventListener("unhandledrejection", function (e) { log("Unhandled: " + (e.reason && e.reason.message ? e.reason.message : e.reason)); });
+  $("connect").addEventListener("click", function () { log("Tapped Connect"); connect(false); });
+  $("connectall").addEventListener("click", function () { log("Tapped Try all devices"); connect(true); });
+  $("disconnect").addEventListener("click", function () { if (dev && dev.gatt.connected) { dev.gatt.disconnect(); } });
+  $("send").addEventListener("click", showText);
+  $("clear").addEventListener("click", clearDisplay);
+  $("runlua").addEventListener("click", runLua);
+  $("stop").addEventListener("click", stopApp);
+
+  if (!navigator.bluetooth) { status("This browser has no Web Bluetooth. Open this page in Bluefy.", true); }
+})();
+</script>
+</body>
+</html>
